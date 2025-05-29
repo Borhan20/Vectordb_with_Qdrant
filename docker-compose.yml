@@ -1,0 +1,15 @@
+version: "3.9"
+
+services:
+  qdrant_app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      - .:/app
+    environment:
+      - UV_COMPILE_BYTECODE=1
+      - UV_LINK_MODE=copy
+    command: ["python", "qdrant.py"]
