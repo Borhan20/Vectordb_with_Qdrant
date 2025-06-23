@@ -11,6 +11,7 @@ import docx
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 import uuid
 from dotenv import load_dotenv
+import json
 
 # Assuming styles.py exists; if not, replace with inline styles
 from styles import apply_custom_styles
@@ -23,7 +24,7 @@ QDRANT_HOST     = os.getenv("QDRANT_HOST", "http://localhost:6333")
 QDRANT_API_KEY  = os.getenv("QDRANT_API_KEY")
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")
 EMBEDDING_MODEL = "text-embedding-3-small"
-COLLECTION_NAME = "yaana_documents"
+COLLECTION_NAME = "neustring_deals"
 
 # Global clients & counters
 qdrant_client = None
@@ -87,17 +88,45 @@ def get_embedding(text: str):
     resp = openai_client.embeddings.create(input=text, model=EMBEDDING_MODEL)
     return resp.data[0].embedding
 
-# Extract text from uploaded files
 def extract_text(file_bytes: bytes, mime: str) -> str:
     if mime == "application/pdf":
         reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
         return "\n".join(page.extract_text() or "" for page in reader.pages)
+
     if mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
         doc = docx.Document(io.BytesIO(file_bytes))
         return "\n".join(p.text for p in doc.paragraphs)
+
     if mime == "text/plain":
         return file_bytes.decode()
-    return ""
+
+    if mime == "application/json":
+        try:
+            data = json.loads(file_bytes.decode())
+            return extract_text_from_json(data)
+        except Exception as e:
+            return f"[Error reading JSON: {e}]"
+
+    return "[Unsupported file type]"
+
+# Helper to recursively flatten JSON
+def extract_text_from_json(data, indent=0) -> str:
+    lines = []
+
+    if isinstance(data, dict):
+        for key, value in data.items():
+            lines.append(" " * indent + f"{key}:")
+            lines.append(extract_text_from_json(value, indent + 2))
+
+    elif isinstance(data, list):
+        for i, item in enumerate(data):
+            lines.append(" " * indent + f"- Item {i}:")
+            lines.append(extract_text_from_json(item, indent + 2))
+
+    else:
+        lines.append(" " * indent + str(data))
+
+    return "\n".join(lines)
 
 # Process document synchronously (runs in background)
 def _process_document(e: events.UploadEventArguments):
@@ -123,7 +152,6 @@ def _process_document(e: events.UploadEventArguments):
     qdrant_client.upsert(collection_name=COLLECTION_NAME, points=points)
     return points, len(text), len(points)
 
-# Perform search synchronously (runs in background)
 def _perform_search(query: str):
     if not qdrant_client or not openai_client:
         if not init_clients():
@@ -131,11 +159,34 @@ def _perform_search(query: str):
     query_embedding = get_embedding(query)
     if not query_embedding:
         return None
-    return qdrant_client.search(
+    results = qdrant_client.search(
         collection_name=COLLECTION_NAME,
         query_vector=query_embedding,
         limit=5
     )
+    context = "\n\n".join([r.payload['text'] for r in results if 'text' in r.payload])
+    return results, context
+
+def call_openai_chat(query: str, context: str, doc_names: list) -> str:
+    joined_names = ", ".join(doc_names)
+    messages = [
+        {"role": "system", "content": (
+            "You are a helpful assistant. Answer the user's query using the context below. "
+            "The context comes from documents: " + joined_names + ". "
+            "If any document contains relevant data, use it to answer. "
+            "Otherwise, say you don't have enough information."
+        )},
+        {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {query}"}
+    ]
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=messages,
+            temperature=0.2,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        return f"[OpenAI error: {e}]"
 
 # Async function to handle document uploads
 async def upload_document(e: events.UploadEventArguments):
@@ -201,12 +252,19 @@ async def search_documents(query: str):
     try:
         # Run search in a background thread
         loop = asyncio.get_running_loop()
-        results = await loop.run_in_executor(None, _perform_search, query)
-        if results is None:
+        result_pair = await loop.run_in_executor(None, _perform_search, query)
+        if not result_pair:
             raise Exception("Failed to perform search")
+        results, context = result_pair
+        doc_names = [r.payload.get('filename', 'unknown') for r in results]
+        llm_answer = await loop.run_in_executor(None, call_openai_chat, query, context, doc_names)
 
         # Display results after search completes
         search_results.clear()
+        with search_results:
+            with ui.card().classes('bg-indigo-50 p-4 border-l-4 border-indigo-500'):
+                ui.label("🤖 LLM Answer").classes('text-h6 text-indigo-700 font-bold')
+                ui.markdown(llm_answer).classes('text-body2 text-indigo-800')
         if not results:
             with search_results:
                 with ui.column().classes('text-center p-8 gap-4'):
@@ -317,7 +375,7 @@ def main():
                         on_upload=upload_document,
                         auto_upload=True,
                         multiple=True
-                    ).props('accept=".pdf,.docx,.txt"').classes("w-full q-mt-md justify-center items-center")
+                    ).props('accept=".pdf,.docx,.txt, .json"').classes("w-full q-mt-md justify-center items-center")
                     upload_status = ui.column().classes("w-full q-mt-md")
 
                 with ui.card().classes('search-card p-6'):
